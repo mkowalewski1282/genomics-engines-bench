@@ -1,0 +1,103 @@
+"""The polars-bio runner: a fresh process, polars-bio reads the Parquet itself, the result is
+consumed in a streaming fashion, and the protocol is the same as in bench_client.
+
+With target_partitions > 1, polars-bio 0.28 computed merge and subtract separately in each
+partition (bug #372, fixed in 0.29.0). With polars-bio 0.36 the two-partition test covers all
+operations without xfail marks."""
+
+from __future__ import annotations
+
+import json
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+from bench import checksum as cs
+from bench.ops import OPS, UNARY_OPS
+from tests.parquet_fixture import write_parts
+
+REPO = Path(__file__).resolve().parent.parent
+PROTOCOL_KEYS = {"rows", "checksum", "t_total_s", "phases", "extra", "peak_rss_bytes"}
+
+
+def run_runner(args: list[str], timeout: int = 180) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        [sys.executable, "-m", "bench.runners.polars_bio_runner", *args],
+        cwd=REPO, capture_output=True, text=True, timeout=timeout,
+    )
+
+
+def scenario_args(op, a, b) -> list[str]:
+    args = ["--op", op, "--left", str(a)]
+    return args if op in UNARY_OPS else [*args, "--right", str(b)]
+
+
+def report(r: subprocess.CompletedProcess) -> dict:
+    assert r.returncode == 0, f"exit code {r.returncode}\nstderr:\n{r.stderr[-3000:]}"
+    lines = r.stdout.strip().splitlines()
+    assert len(lines) == 1, f"stdout must be one JSON line, got:\n{r.stdout}"
+    return json.loads(lines[0])
+
+
+def expected_checksum(op, parquet_expected) -> str:
+    return cs.format_checksum(cs.checksum_rows(op, parquet_expected[op].elements()))
+
+
+@pytest.mark.parametrize("op", OPS)
+def test_single_partition_matches_polars_bio_oracle(op, parquet_dirs, parquet_expected):
+    got = report(run_runner([*scenario_args(op, *parquet_dirs), "--threads", "1"]))
+    assert set(got) == PROTOCOL_KEYS
+    assert got["rows"] == sum(parquet_expected[op].values())
+    assert got["checksum"] == expected_checksum(op, parquet_expected)
+    assert set(got["extra"]) == {"target_partitions", "checksum_s"}
+    assert set(got["phases"]) == {"first_batch_s"}
+    assert got["extra"]["target_partitions"] == 1
+    assert got["t_total_s"] > 0 and got["peak_rss_bytes"] > 10 * 2**20
+    # The checksum is computed AFTER the clock is stopped: its time is reported separately, and
+    # the "up to the first batch" phase fits within the total time.
+    assert got["extra"]["checksum_s"] > 0
+    assert 0 < got["phases"]["first_batch_s"] <= got["t_total_s"]
+
+
+@pytest.mark.parametrize("op", OPS)
+def test_two_partitions(op, parquet_dirs, parquet_expected):
+    got = report(run_runner([*scenario_args(op, *parquet_dirs), "--threads", "2"]))
+    assert got["extra"]["target_partitions"] == 2
+    assert got["checksum"] == expected_checksum(op, parquet_expected)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        [],
+        ["--op", "merge", "--threads", "1"],
+        ["--op", "overlap", "--left", "x", "--threads", "1"],
+        ["--op", "merge", "--left", "x", "--right", "y", "--threads", "1"],
+        ["--op", "merge", "--left", "x", "--threads", "0"],
+        ["--op", "merge", "--left", "x"],
+        ["--op", "merge", "--left", "x", "--threads", "1", "--cols", "contig,pos_start"],
+        ["--op", "join", "--left", "x", "--threads", "1"],
+    ],
+)
+def test_rejects_bad_arguments(args):
+    r = run_runner(args, timeout=60)
+    assert r.returncode == 2, f"{args}: exit code {r.returncode}, stderr: {r.stderr}"
+    assert r.stdout == ""
+
+
+def test_missing_data_path_is_reported(tmp_path):
+    missing = tmp_path / "no_such_dir"
+    r = run_runner(["--op", "merge", "--left", str(missing), "--threads", "1"])
+    assert r.returncode == 1, r.stderr
+    assert str(missing) in r.stderr and r.stdout == ""
+
+
+def test_empty_result_reports_zero_rows(tmp_path):
+    """Disjoint chromosomes: overlap with no result: zero rows, a zero checksum, the phase within bounds."""
+    left = write_parts([("chrA", 10, 20), ("chrA", 30, 40)], tmp_path / "a")
+    right = write_parts([("chrB", 10, 20), ("chrB", 30, 40)], tmp_path / "b")
+    got = report(run_runner(["--op", "overlap", "--left", str(left), "--right", str(right), "--threads", "1"]))
+    assert (got["rows"], got["checksum"]) == (0, "0x0000000000000000")
+    assert 0 <= got["phases"]["first_batch_s"] <= got["t_total_s"]

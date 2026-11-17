@@ -1,0 +1,160 @@
+"""The protocol of the Ballista runner: time, a checksum that agrees with
+bench/checksum.py, peak memory, the number of partitions from BIO_TARGET_PARTITIONS,
+plus agreement of the Rust checksum implementation with the Python one on shared
+golden values.
+
+A missing binary is an ERROR. Build:
+cd engines/ballista-genomics && CARGO_BUILD_JOBS=1 cargo build --bins
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+
+import pyarrow.parquet as pq
+import pytest
+
+from bench import checksum as cs
+from bench.ops import OPS, UNARY_OPS
+from tests.bench import checksum_vectors as vec
+from tests.test_ballista_multiprocess import NODE_BINARY, _require
+from tests.parquet_fixture import write_parts
+from tests.test_ballista_parquet import BALLISTA_DIR, run_client
+
+PROTOCOL_KEYS = {"rows", "checksum", "t_total_s", "phases", "extra", "peak_rss_bytes"}
+
+
+def report(r: subprocess.CompletedProcess) -> dict:
+    assert r.returncode == 0, f"exit code {r.returncode}\nstderr:\n{r.stderr[-3000:]}"
+    lines = r.stdout.strip().splitlines()
+    assert len(lines) == 1, f"stdout must be one JSON line, got:\n{r.stdout}"
+    return json.loads(lines[0])
+
+
+def scenario_args(op, a, b) -> list[str]:
+    args = ["--op", op, "--left", str(a)]
+    return args if op in UNARY_OPS else [*args, "--right", str(b)]
+
+
+def expected_checksum(op, parquet_expected) -> str:
+    return cs.format_checksum(cs.checksum_rows(op, parquet_expected[op].elements()))
+
+
+@pytest.mark.parametrize("op", OPS)
+def test_rust_checksum_matches_golden_values(op, tmp_path):
+    path = tmp_path / f"{op}.parquet"
+    pq.write_table(vec.table(op), path)
+    got = report(run_client(["--op", op, "--checksum", str(path)], timeout=60))
+    assert got == {"rows": len(vec.ROWS[op]), "checksum": vec.CHECKSUMS[op]}
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--checksum", "x.parquet"],
+        ["--op", "merge", "--checksum", "x.parquet", "--left", "y"],
+        ["--op", "merge", "--checksum", "x.parquet", "--output", "y.parquet"],
+    ],
+)
+def test_checksum_mode_rejects_other_arguments(args):
+    r = run_client(args, timeout=30)
+    assert r.returncode == 2, f"{args}: exit code {r.returncode}, stderr: {r.stderr}"
+    assert "usage" in r.stderr and r.stdout == ""
+
+
+@pytest.mark.parametrize("op", OPS)
+def test_report_follows_protocol_and_matches_oracle(op, parquet_dirs, parquet_expected):
+    got = report(run_client(scenario_args(op, *parquet_dirs)))
+    assert set(got) == PROTOCOL_KEYS
+    assert got["rows"] == sum(parquet_expected[op].values())
+    assert got["checksum"] == expected_checksum(op, parquet_expected)
+    assert got["t_total_s"] > 0 and set(got["phases"]) == {"first_batch_s"}
+    assert set(got["extra"]) == {"target_partitions", "checksum_s"}
+    assert got["extra"]["target_partitions"] == 4
+    # The checksum is computed AFTER the clock is stopped.
+    assert got["extra"]["checksum_s"] > 0
+    assert 0 < got["phases"]["first_batch_s"] <= got["t_total_s"]
+    assert got["peak_rss_bytes"] > 10 * 2**20
+
+
+def test_empty_result_reports_zero_rows(tmp_path):
+    left = write_parts([("chrA", 10, 20), ("chrA", 30, 40)], tmp_path / "a")
+    right = write_parts([("chrB", 10, 20), ("chrB", 30, 40)], tmp_path / "b")
+    got = report(run_client(["--op", "overlap", "--left", str(left), "--right", str(right)]))
+    assert (got["rows"], got["checksum"]) == (0, "0x0000000000000000")
+    assert 0 <= got["phases"]["first_batch_s"] <= got["t_total_s"]
+
+
+def test_target_partitions_come_from_environment(parquet_dirs, parquet_expected):
+    env = {**os.environ, "BIO_TARGET_PARTITIONS": "3"}
+    got = report(run_client(scenario_args("subtract", *parquet_dirs), env=env))
+    assert got["extra"]["target_partitions"] == 3
+    assert got["checksum"] == expected_checksum("subtract", parquet_expected)
+
+
+@pytest.mark.parametrize("value", ["1", "zero", "-4"])
+def test_invalid_target_partitions_is_a_usage_error(value, parquet_dirs):
+    env = {**os.environ, "BIO_TARGET_PARTITIONS": value}
+    r = run_client(["--op", "merge", "--left", str(parquet_dirs[0])], env=env, timeout=30)
+    assert r.returncode == 2, r.stderr
+    assert "BIO_TARGET_PARTITIONS" in r.stderr and r.stdout == ""
+
+
+def test_ballista_node_rejects_invalid_target_partitions():
+    _require(NODE_BINARY)
+    r = subprocess.run(
+        [str(NODE_BINARY), "scheduler", "--port", "1"],
+        cwd=BALLISTA_DIR,
+        env={**os.environ, "BIO_TARGET_PARTITIONS": "1"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert r.returncode == 2, r.stderr
+    assert "BIO_TARGET_PARTITIONS" in r.stderr
+
+
+@pytest.mark.parametrize("value", ["1", "x", str(16 * 2**20 - 1), str(2**32)])
+def test_invalid_grpc_limit_is_a_usage_error(value, parquet_dirs):
+    env = {**os.environ, "BALLISTA_GRPC_MAX_MESSAGE_BYTES": value}
+    r = run_client(["--op", "merge", "--left", str(parquet_dirs[0])], env=env, timeout=30)
+    assert r.returncode == 2, r.stderr
+    assert "BALLISTA_GRPC_MAX_MESSAGE_BYTES" in r.stderr and r.stdout == ""
+
+
+def test_ballista_node_rejects_invalid_grpc_limit():
+    _require(NODE_BINARY)
+    r = subprocess.run(
+        [str(NODE_BINARY), "scheduler", "--port", "1"],
+        cwd=BALLISTA_DIR,
+        env={**os.environ, "BALLISTA_GRPC_MAX_MESSAGE_BYTES": "1024"},
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert r.returncode == 2, r.stderr
+    assert "BALLISTA_GRPC_MAX_MESSAGE_BYTES" in r.stderr
+
+
+def test_explain_analyze_writes_the_distributed_plan(parquet_dirs, tmp_path):
+    target = tmp_path / "merge_1.txt"
+    r = run_client(["--op", "merge", "--left", str(parquet_dirs[0]), "--explain-analyze", str(target)])
+    assert r.returncode == 0, r.stderr[-3000:]
+    text = target.read_text()
+    assert "MergeExec" in text and "ShuffleWriterExec" in text
+    assert json.loads(r.stdout) == {"explain_bytes": len(text.encode())}
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["--op", "merge", "--left", "x", "--explain-analyze", "a.txt", "--output", "b.parquet"],
+        ["--op", "merge", "--checksum", "x.parquet", "--explain-analyze", "a.txt"],
+    ],
+)
+def test_explain_analyze_rejects_conflicting_modes(args):
+    r = run_client(args, timeout=30)
+    assert r.returncode == 2, f"{args}: exit code {r.returncode}, stderr: {r.stderr}"
+    assert r.stdout == ""

@@ -1,0 +1,20 @@
+# Smoke series: all variants at P = 1 and 2 on the pair 1-2 (merge: dataset 1), 1 run without
+# warm-up — short, it only checks that the tool works; run it before every large series:
+#   uv run python -m bench.orchestrator bench/conf/smoke.yaml
+# The main series (scaling over P = 1, 2, 4, 8): bench/conf/scaling.yaml.
+series: smoke
+scenarios:
+  - {op: overlap, pair: "1-2"}
+  - {op: nearest, pair: "1-2"}
+  - {op: coverage, pair: "1-2"}
+  - {op: merge, dataset: 1}
+  - {op: subtract, pair: "1-2"}
+variants: [polars_bio, ballista, sail]
+parallelism: [1, 2]
+repeats: 1
+warmup: 0
+# The smoke series also checks the extra EXPLAIN ANALYZE run in Ballista blocks.
+explain: true
+seed: 20261001
+# Pause before every run: lets WSL2 return memory to the host, which reduces control-run noise.
+settle_s: 3.0
