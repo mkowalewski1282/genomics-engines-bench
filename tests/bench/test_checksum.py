@@ -1,0 +1,146 @@
+"""Row-order-independent checksum."""
+
+from __future__ import annotations
+
+import random
+
+import polars as pl
+import pyarrow as pa
+import pytest
+
+from bench import checksum as cs
+from bench.ops import OPS
+from tests.bench import checksum_vectors as vec
+
+
+@pytest.mark.parametrize("op", OPS)
+def test_definition_gives_golden_values(op):
+    assert cs.format_checksum(cs.checksum_rows(op, vec.key_rows(op))) == vec.CHECKSUMS[op]
+
+
+@pytest.mark.parametrize("op", OPS)
+def test_streaming_accumulator_gives_golden_values(op):
+    acc = cs.Checksum(op)
+    acc.update(vec.table(op))
+    assert (acc.hex(), acc.rows) == (vec.CHECKSUMS[op], len(vec.ROWS[op]))
+
+
+def test_empty_result_has_zero_checksum():
+    acc = cs.Checksum("merge")
+    acc.update(vec.table("merge").slice(0, 0))
+    assert (acc.hex(), acc.rows) == ("0x0000000000000000", 0)
+
+
+@pytest.mark.parametrize("op", OPS)
+def test_order_and_batching_do_not_matter(op):
+    t = vec.table(op)
+    reversed_rows = t.take(list(reversed(range(t.num_rows))))
+    acc = cs.Checksum(op)
+    for batch in reversed_rows.to_batches(max_chunksize=1):
+        acc.update(batch)
+    assert acc.hex() == vec.CHECKSUMS[op]
+
+
+def test_detects_values_swapped_between_rows():
+    """A linear sum would depend only on column sums; swapping ends between rows
+    (same column sums) must change the result."""
+    rows = [("chr1", 100, 200, "chr1", 150, 300), ("chr1", 400, 500, "chr1", 450, 600)]
+    swapped = [("chr1", 100, 500, "chr1", 150, 300), ("chr1", 400, 200, "chr1", 450, 600)]
+    assert cs.checksum_rows("overlap", rows) != cs.checksum_rows("overlap", swapped)
+
+
+def test_detects_missing_duplicate():
+    rows = vec.key_rows("subtract")
+    assert cs.checksum_rows("subtract", rows) != cs.checksum_rows("subtract", rows[1:])
+
+
+def test_nearest_ignores_neighbour_identity_but_not_distance():
+    t = vec.table("nearest")
+    other_neighbour = t.set_column(
+        t.schema.get_field_index("start_2"), "start_2", pa.array([1, 2, 3], pa.int32())
+    )
+    longer = t.set_column(
+        t.schema.get_field_index("distance"), "distance", pa.array([101, None, 60], pa.int64())
+    )
+    for variant, same in [(other_neighbour, True), (longer, False)]:
+        acc = cs.Checksum("nearest")
+        acc.update(variant)
+        assert (acc.hex() == vec.CHECKSUMS["nearest"]) is same
+
+
+def test_missing_value_differs_from_zero():
+    assert cs.checksum_rows("nearest", [("chrA", 10, 20, None)]) != cs.checksum_rows(
+        "nearest", [("chrA", 10, 20, 0)]
+    )
+
+
+def test_accumulator_matches_definition_on_mixed_types():
+    """string_view (how DataFusion 53 reads strings from Parquet), int32/int64, missing values
+    and a table made of several chunks; the result matches the row-by-row definition."""
+    rng = random.Random(7)
+    rows = [
+        (rng.choice(["chr1", "chr2", "chrX", "chr10", None]), rng.randrange(2**31),
+         rng.randrange(2**31), rng.choice([None, rng.randrange(10**6)]))
+        for _ in range(5000)
+    ]
+    t = pa.table({
+        "chrom": pa.array([r[0] for r in rows], pa.string_view()),
+        "start": pa.array([r[1] for r in rows], pa.int32()),
+        "end": pa.array([r[2] for r in rows], pa.int64()),
+        "coverage": pa.array([r[3] for r in rows], pa.int64()),
+    })
+    acc = cs.Checksum("coverage")
+    acc.update(pa.concat_tables([t.slice(0, 1234), t.slice(1234)]))
+    assert acc.hex() == cs.format_checksum(cs.checksum_rows("coverage", rows))
+
+
+def test_accepts_polars_dataframe():
+    acc = cs.Checksum("merge")
+    acc.update(pl.from_arrow(vec.table("merge")))
+    assert acc.hex() == vec.CHECKSUMS["merge"]
+
+
+def test_missing_key_column_is_reported():
+    acc = cs.Checksum("merge")
+    with pytest.raises(KeyError, match="n_intervals"):
+        acc.update(vec.table("subtract"))
+
+
+def test_unknown_operation_is_rejected():
+    with pytest.raises(ValueError, match="unknown operation"):
+        cs.Checksum("join")
+
+
+def _coverage_rows_and_table(n: int = 5000):
+    rng = random.Random(11)
+    rows = [
+        (rng.choice(["chr1", "chr2", "chrX", None]), rng.randrange(2**31), rng.randrange(2**31),
+         rng.choice([None, rng.randrange(10**6)]))
+        for _ in range(n)
+    ]
+    table = pa.table({
+        "chrom": pa.array([r[0] for r in rows], pa.string_view()),
+        "start": pa.array([r[1] for r in rows], pa.int32()),
+        "end": pa.array([r[2] for r in rows], pa.int64()),
+        "coverage": pa.array([r[3] for r in rows], pa.int64()),
+    })
+    return rows, table
+
+
+def test_update_all_matches_definition_for_many_small_parts(monkeypatch):
+    """Sail returns the result in batches of ~1.5k rows; update_all merges them before computing
+    (a small GROUP_ROWS forces several groups and a remainder); parts alternate Table and RecordBatch."""
+    monkeypatch.setattr(cs, "GROUP_ROWS", 700)
+    rows, table = _coverage_rows_and_table()
+    parts = [table.slice(i, 100) for i in range(0, table.num_rows, 100)]
+    parts = [p.combine_chunks().to_batches()[0] if i % 2 else p for i, p in enumerate(parts)]
+    acc = cs.Checksum("coverage")
+    acc.update_all(parts)
+    assert acc.rows == len(rows)
+    assert acc.hex() == cs.format_checksum(cs.checksum_rows("coverage", rows))
+
+
+def test_update_all_of_nothing_is_zero():
+    acc = cs.Checksum("overlap")
+    acc.update_all([])
+    assert (acc.rows, acc.hex()) == (0, "0x0000000000000000")

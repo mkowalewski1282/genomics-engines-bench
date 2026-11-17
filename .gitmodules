@@ -1,0 +1,6 @@
+[submodule "engines/ballista-genomics"]
+	path = engines/ballista-genomics
+	url = ../ballista-genomics
+[submodule "engines/sail-genomics"]
+	path = engines/sail-genomics
+	url = ../sail-genomics

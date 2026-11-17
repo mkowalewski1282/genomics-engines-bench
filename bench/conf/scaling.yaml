@@ -1,0 +1,36 @@
+# Scaling series: the polars_bio, ballista and sail variants at P = 1, 2, 4 and 8 CPUs, on the
+# pairs 2-7 and 7-0 and the datasets 7 and 0. The main measurement series (smoke.yaml only checks
+# correctness):
+#   uv run python -m bench.orchestrator bench/conf/scaling.yaml
+# Report (median table and plots against P): uv run python -m bench.report bench/results/scaling/<time>
+#
+# Time budget (runs counted from bench/orchestrator.py, run_block):
+#   block = 2·10 control runs (controls("start") and controls("end"), control_repeats = 10)
+#         + 1 warm-up round × 10 scenarios
+#         + 5 rounds × 10 scenarios (repeats = 5)
+#         = 2·10 + 10 scenarios × 6 = 80 runs
+#   12 blocks (3 variants × 4 values of P) × 80 = 960 runs + 10 reference results (polars-bio
+#   reference runs on 1 partition, one per scenario; the overlap 7-0 control run is already among
+#   the scenarios, so it adds no reference run).
+#   ~5.5 s per run (0.2–3 s run time + ~1 s startup + 3 s settle_s) ≈ 1.5 h.
+#   With every block repeated after a control-run drift: ≤ 3 h (limit 4 h).
+series: scaling
+scenarios:
+  - {op: overlap, pair: "2-7"}
+  - {op: nearest, pair: "2-7"}
+  - {op: coverage, pair: "2-7"}
+  - {op: subtract, pair: "2-7"}
+  - {op: overlap, pair: "7-0"}
+  - {op: nearest, pair: "7-0"}
+  - {op: coverage, pair: "7-0"}
+  - {op: subtract, pair: "7-0"}
+  - {op: merge, dataset: 7}
+  - {op: merge, dataset: 0}
+variants: [polars_bio, ballista, sail]
+parallelism: [1, 2, 4, 8]
+repeats: 5
+warmup: 1
+control_repeats: 10
+# Pause before every run: lets WSL2 return memory to the host, which reduces control-run noise.
+settle_s: 3.0
+seed: 20261115
